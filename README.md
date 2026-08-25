@@ -4,17 +4,6 @@
 
 # dict
 
-```
-      $$\ $$\             $$\
-      $$ |\__|            $$ |
- $$$$$$$ |$$\  $$$$$$$\ $$$$$$\
-$$  __$$ |$$ |$$  _____|\_$$  _|
-$$ /  $$ |$$ |$$ /        $$ |
-$$ |  $$ |$$ |$$ |        $$ |$$\
-\$$$$$$$ |$$ |\$$$$$$$\   \$$$$  |
- \_______|\__| \_______|   \____/
-```
-
 **A terminal dictionary that gets out of the way.**
 Look up any word without leaving your shell — definitions, phonetics,
 part-of-speech colouring, fuzzy "did you mean" suggestions, and 23 language
