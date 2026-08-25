@@ -1,12 +1,6 @@
 <div align="center">
 
-```
- ┌─────────────────────────────────────────┐
- │  ▄▄▄ █  █ ▄▄▄▄▄   dict — tty dictionary │
- │  █▄▄ █▄▄█   █     terminal word lookup  │
- │  ▄▄█ █  █   █     powered by wiktionary │
- └─────────────────────────────────────────┘
-```
+<img src="assets/icon.png" width="140" alt="dict — terminal word lookup">
 
 # dict
 
