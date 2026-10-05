@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 # dict-cli installer — fetches the tool and puts `dict` on your PATH.
-#   curl -fsSL https://raw.githubusercontent.com/hiraeth-dev/dict-cli/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/viyoga/dict-cli/main/install.sh | sh
 
 set -eu
 
-REPO="hiraeth-dev/dict-cli"
+REPO="viyoga/dict-cli"
 BRANCH="main"
 DEST="${DICT_CLI_HOME:-$HOME/.local/share/dict-cli}"
 BIN_DIR="${DICT_CLI_BIN:-$HOME/.local/bin}"

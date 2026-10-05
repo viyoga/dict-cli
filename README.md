@@ -48,7 +48,7 @@ $ dict time
 ### one-liner (recommended)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/hiraeth-dev/dict-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/viyoga/dict-cli/main/install.sh | sh
 ```
 
 The script:
@@ -62,7 +62,7 @@ The script:
 ### from source (git)
 
 ```sh
-git clone https://github.com/hiraeth-dev/dict-cli.git
+git clone https://github.com/viyoga/dict-cli.git
 cd dict-cli
 chmod +x dict.js
 
@@ -134,5 +134,5 @@ rm -rf ~/.local/share/dict-cli ~/.local/bin/dict ~/.cache/dict-cli
 ---
 
 <div align="center">
-<sub>engine ported from <a href="https://github.com/tristonarmstrong/omarchy-dictionary">omarchy-dictionary</a> (MIT) · data © <a href="https://en.wiktionary.org">Wiktionary</a> contributors (CC BY-SA) · built by <a href="https://github.com/hiraeth-dev">hiraeth-dev</a></sub>
+<sub>engine ported from <a href="https://github.com/tristonarmstrong/omarchy-dictionary">omarchy-dictionary</a> (MIT) · data © <a href="https://en.wiktionary.org">Wiktionary</a> contributors (CC BY-SA) · built by <a href="https://github.com/viyoga">viyoga</a></sub>
 </div>
