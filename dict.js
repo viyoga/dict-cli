@@ -1,12 +1,21 @@
 #!/usr/bin/env node
-// dict — terminal word lookup powered by Wiktionary.
-// Engine ported from tristonarmstrong/omarchy-dictionary (Model.js, MIT).
-// One-shot:  dict <word>
-// REPL:      dict            (type words at the prompt, :q to quit)
-// Flags:     -l <code>  language edition (en, fr, de, ja, …)
-//            --all      show every definition instead of the first 3 per POS
-//            --raw      pipe-friendly plain text (no ANSI, no jabs)
-//            -h/--help
+// dict — terminal word lookup powered by Wiktionary & Free Dictionary.
+// Hybrid engine: Free Dictionary + Wikimedia REST + Commons Audio + Datamuse.
+// Zero dependencies. Pure Node.js built-ins.
+//
+// Usage:
+//   dict <word>            look up a word
+//   dict -p <word>         look up and play pronunciation audio
+//   dict <word> ...        look up multiple words
+//   dict                   interactive REPL (:h for commands, :q to quit)
+//
+// Flags:
+//   -p, --play             play pronunciation audio headlessly
+//   -l, --lang <code>      language edition (default: en)
+//   --all                  show every definition instead of first 3 per POS
+//   --syn                  show synonyms & antonyms
+//   --raw                  plain text, no ANSI colors or jabs (pipe-friendly)
+//   -h, --help             show this help
 
 'use strict';
 
@@ -18,24 +27,32 @@ require(path.join(__dirname, 'dict-engine.js'));
 const E = globalThis.DictEngine;
 
 const MAX_DEFS = 3;
-const FETCH_TIMEOUT_MS = 8000;
 const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(require('os').homedir(), '.cache'), 'dict-cli');
 
-// ---- args ----
+// ---- args & usage ----
 function usage(code) {
   const out = code ? process.stderr : process.stdout;
-  out.write(`dict — look up English words (Wiktionary)
+  out.write(`dict — modern terminal dictionary & pronunciation engine
 
 usage:
-  dict                interactive mode
-  dict <word>         look up a word
-  dict <word> ...     multiple words in one go
+  dict                     interactive mode
+  dict <word>              look up a word
+  dict -p <word>           look up and play audio pronunciation
+  dict <word1> <word2>...  look up multiple words
 
 flags:
-  -l <code>   language edition (${E.LANGUAGES.map(l => l.value).join(', ')}; default en)
-  --all       show every definition, not just the first ${MAX_DEFS} per part of speech
-  --raw       plain text, no colors or jokes — good for piping
-  -h, --help  this text
+  -p, --play      play audio pronunciation (via mpv/ffplay, headless)
+  -l, --lang <code> language edition (e.g. en, fr, de, es, ja; default: en)
+  --all           show all definitions (default: top ${MAX_DEFS} per part of speech)
+  --syn           show synonyms and antonyms
+  --raw           plain text, no colors or jabs (great for pipes/scripts)
+  -h, --help      display this help message
+
+examples:
+  dict serendipity
+  dict -p run
+  dict bonjour -l fr
+  dict "quantum physics"
 `);
   process.exit(code || 0);
 }
@@ -43,55 +60,69 @@ flags:
 const argv = process.argv.slice(2);
 let lang = 'en';
 let showAll = false;
+let showSyn = false;
+let playAudioFlag = false;
 let raw = false;
 const words = [];
 
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '-h' || a === '--help') usage(0);
+  else if (a === '-p' || a === '--play') playAudioFlag = true;
   else if (a === '--all') showAll = true;
+  else if (a === '--syn') showSyn = true;
   else if (a === '--raw') raw = true;
   else if (a === '-l' || a === '--lang') {
-    lang = (argv[++i] || '').toLowerCase();
+    lang = (argv[++i] || '').toLowerCase().trim();
     if (!lang) usage(1);
   } else if (a.startsWith('-')) usage(1);
   else words.push(a);
 }
+
 if (!E.langLabel(lang)) {
   process.stderr.write(`dict: unknown language "${lang}"\n`);
   process.exit(1);
 }
 
-// ---- color ----
-// Deliberately kept to the base 16 ANSI codes (no 256-color/truecolor hex)
-// so the app inherits whatever terminal theme is active — Catppuccin,
-// Dracula, matugen, whatever — instead of fighting it with hardcoded hues.
-const tty = process.stdout.isTTY && !process.env.NO_COLOR;
+// ---- color & formatting ----
+// Deliberately uses standard 16 ANSI codes so colors adapt seamlessly to whatever
+// terminal colorscheme is active (Catppuccin, Tokyo Night, Dracula, matugen, Noctalia).
+const tty = Boolean(process.stdout.isTTY && !process.env.NO_COLOR);
 const colorOn = tty && !raw;
+
 const c = colorOn ? {
   bold: s => `\x1b[1m${s}\x1b[0m`,
   dim: s => `\x1b[2m${s}\x1b[0m`,
   accent: s => `\x1b[36m${s}\x1b[0m`,
   it: s => `\x1b[3m${s}\x1b[0m`,
-  ok: s => `\x1b[32m${s}\x1b[0m`
+  ok: s => `\x1b[32m${s}\x1b[0m`,
+  warn: s => `\x1b[33m${s}\x1b[0m`,
+  magenta: s => `\x1b[35m${s}\x1b[0m`,
+  red: s => `\x1b[31m${s}\x1b[0m`
 } : {
-  bold: s => s, dim: s => s, accent: s => s, it: s => s, ok: s => s
+  bold: s => s, dim: s => s, accent: s => s, it: s => s,
+  ok: s => s, warn: s => s, magenta: s => s, red: s => s
 };
-// `paint` is for the part-of-speech hue cycle; `pill` is a soft badge used
-// for "did you mean" suggestions.
+
 function paint(code, s) { return colorOn ? `\x1b[${code}m${s}\x1b[0m` : s; }
-function pill(s) { return colorOn ? `\x1b[100m\x1b[97m ${s} \x1b[0m` : `[${s}]`; }
+function pill(s, hue) {
+  if (!colorOn) return `[${s}]`;
+  const code = hue ? `\x1b[${hue}m` : '\x1b[100m\x1b[97m';
+  return `${code} ${s} \x1b[0m`;
+}
+function synPill(s) { return colorOn ? `\x1b[48;5;236m\x1b[32m ${s} \x1b[0m` : `[${s}]`; }
+function antPill(s) { return colorOn ? `\x1b[48;5;236m\x1b[31m ${s} \x1b[0m` : `[${s}]`; }
+
 const dot = c.dim('  ') + c.ok('·') + c.dim('  ');
 
-// Stable color per part of speech so "noun" is always the same hue in a
-// given run — common ones get a curated color, anything else falls back to
-// a deterministic hash so it's at least consistent.
+// Part of speech hues for visual distinction
 const POS_HUES = {
   noun: 36, verb: 35, adjective: 33, adj: 33, adverb: 32, adv: 32,
   pronoun: 34, preposition: 34, postposition: 34, determiner: 34,
   article: 34, conjunction: 34, interjection: 31, numeral: 33,
   idiom: 35, phrase: 35, proverb: 35, prefix: 33, suffix: 33
 };
+
 function posHue(pos) {
   if (POS_HUES[pos]) return POS_HUES[pos];
   let h = 0;
@@ -103,8 +134,9 @@ function posHue(pos) {
 // ---- layout ----
 function termWidth() {
   const cols = process.stdout.columns;
-  return Math.max(40, Math.min(cols || 80, 96));
+  return Math.max(40, Math.min(cols || 80, 100));
 }
+
 function wrapText(text, width) {
   const words = String(text).split(/\s+/).filter(Boolean);
   const lines = [];
@@ -118,6 +150,7 @@ function wrapText(text, width) {
   return lines.length ? lines : [''];
 }
 
+// ---- jabs & kaomoji for unknown queries ----
 const jabs = [
   'nice try. did you mean to spell that correctly?',
   'that\'s not a word. try again, genius.',
@@ -136,8 +169,9 @@ const jabs = [
   'that\'s not a word. try harder.',
   'are you typing with your elbows?',
   'even autocorrect gave up on that one.',
-  'i googled it. nothing. embarrassing.',
+  'i looked everywhere. nothing. embarrassing.'
 ];
+
 const kaomoji = [
   '(◍•ᴗ•◍)♡ ✧*。', '(つ◉益◉)つ', '(╯°□°）╯︵ ┻━┻',
   '(⊙_⊙)', '(¬_¬)', '(￣ヘ￣)', 'ಠ_ಠ', '(；一_一)',
@@ -147,79 +181,81 @@ const kaomoji = [
   '(◕‿◕)', '(ᗒᗨᗕ)', 'ヽ(´ー｀)ノ', '＼(◎o◎)／',
   '(＾▽＾)', 'ᕙ(▀̿̿Ĺ̯̿̿▀̿ ̿)ᕗ', '┬─┬ノ( º _ ºノ)',
   '(ಥ_ಥ)', '(◞‸◟)', '〳◔Ĺ̯◔〵', '(;´Д`)',
-  '(´-ω-`)', '〜(꒪꒳꒪)〜', '(˘̩̩̩̩̩̩̩̩˘)', '(个_个)',
-  'ヽ(￣д￣;)ノ', '(￣□￣;)', '∑(O_O;)', '(╯▽╰)',
+  '(´-ω-`)', '〜(꒪꒳꒪)〜', '(˘̩̩̩̩̩̩̩̩˘)', '(个_个)'
 ];
 
 // ---- cache ----
-function cachePath(word) {
-  const safe = encodeURIComponent(word.toLowerCase()).replace(/%/g, '_');
-  return path.join(CACHE_DIR, lang, safe + '.json');
-}
-function readCache(word) {
-  try { return JSON.parse(fs.readFileSync(cachePath(word), 'utf8')); }
-  catch (e) { return null; }
-}
-function writeCache(word, entry) {
-  try {
-    fs.mkdirSync(path.dirname(cachePath(word)), { recursive: true });
-    fs.writeFileSync(cachePath(word), JSON.stringify(entry));
-  } catch (e) { /* cache is best-effort */ }
+function cachePath(word, targetLang) {
+  const safe = encodeURIComponent(word.toLowerCase().trim()).replace(/%/g, '_');
+  return path.join(CACHE_DIR, targetLang || lang, safe + '.json');
 }
 
-// ---- lookup ----
-async function fetchExtract(word) {
-  const url = E.lookupUrl(word, lang);
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+function readCache(word, targetLang) {
   try {
-    const r = await fetch(url, { signal: ac.signal });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return await r.text();
-  } finally {
-    clearTimeout(t);
+    const rawData = fs.readFileSync(cachePath(word, targetLang), 'utf8');
+    return JSON.parse(rawData);
+  } catch (e) {
+    return null;
   }
 }
 
-async function lookup(word) {
-  const cached = readCache(word);
+function writeCache(word, entry, targetLang) {
+  try {
+    const p = cachePath(word, targetLang);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(entry));
+  } catch (e) {
+    /* best-effort cache */
+  }
+}
+
+// ---- lookup logic ----
+async function lookupWord(word, targetLang) {
+  const currentLang = targetLang || lang;
+  const cached = readCache(word, currentLang);
   if (cached && cached.__notfound !== true) return cached;
 
-  const res = E.parseResponse(await fetchExtract(word), lang);
+  const res = await E.lookup(word, currentLang);
   if (res.ok) {
-    writeCache(word, res.entry);
+    writeCache(word, res.entry, currentLang);
     return res.entry;
   }
+
   if (res.kind === 'notfound') {
-    // remember misses so repeated typos don't refetch
     try {
-      fs.mkdirSync(path.dirname(cachePath(word)), { recursive: true });
-      fs.writeFileSync(cachePath(word), JSON.stringify({ __notfound: true }));
+      const p = cachePath(word, currentLang);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, JSON.stringify({ __notfound: true }));
     } catch (e) {}
-    const err = new Error(res.error);
+    const err = new Error(res.error || `no entry for "${word}"`);
     err.notFound = true;
     throw err;
   }
+
   throw new Error(res.error || 'lookup failed');
 }
 
-// ---- fuzzy / suggestions ----
+// Offline wordlist fallback loader
 let wordlistLoaded = false;
-function suggest(word) {
-  if (!wordlistLoaded) {
-    try {
-      const src = fs.readFileSync(path.join(__dirname, 'dict-wordlist.js'), 'utf8');
-      E.setWordlist(new Function(src + '; return ENGLISH_WORDLIST;')());
+function ensureWordlist() {
+  if (wordlistLoaded) return;
+  try {
+    const wlPath = path.join(__dirname, 'dict-wordlist.js');
+    if (fs.existsSync(wlPath)) {
+      const src = fs.readFileSync(wlPath, 'utf8');
+      const wl = new Function(src + '; return ENGLISH_WORDLIST;')();
+      E.setWordlist(wl);
       wordlistLoaded = true;
-    } catch (e) { /* no suggestions without the list */ }
-  }
-  return E.fuzzyMatch(word);
+    }
+  } catch (e) {}
+}
+
+async function getSuggestions(word) {
+  ensureWordlist();
+  return await E.suggest(word);
 }
 
 // ---- spinner ----
-// Cached lookups resolve near-instantly so doLookup() skips the spinner for
-// those; anything that has to hit the network gets one, so a slow reply
-// reads as "fetching" instead of "did this thing hang".
 let cursorHidden = false;
 function hideCursor() { if (tty) { process.stdout.write('\x1b[?25l'); cursorHidden = true; } }
 function showCursor() { if (cursorHidden) { process.stdout.write('\x1b[?25h'); cursorHidden = false; } }
@@ -242,18 +278,26 @@ function startSpinner(label) {
   };
 }
 
-// ---- render ----
-function renderEntry(entry) {
+// ---- rendering ----
+function renderEntry(entry, opts = {}) {
   const width = termWidth();
+  const willPlay = Boolean(opts.play || playAudioFlag);
+
+  // Header line
   let head = c.bold(c.accent(entry.word));
   if (entry.phonetic) head += '  ' + c.dim(entry.phonetic);
-  if (entry.language && entry.language !== 'en') head += '  ' + c.dim('[' + E.langLabel(entry.language) + ']');
+  if (entry.audioUrl) head += '  ' + c.dim(colorOn ? '🔊' : '[audio]');
+  if (entry.language && entry.language !== 'en') {
+    head += '  ' + c.dim('[' + E.langLabel(entry.language) + ']');
+  }
+
   console.log('');
   console.log(head);
 
   for (const meaning of entry.meanings) {
     const pos = String(meaning.partOfSpeech || '').toLowerCase();
     const hue = posHue(pos);
+
     console.log('');
     console.log('  ' + paint(hue, '▍') + ' ' + paint(hue, pos));
 
@@ -262,72 +306,139 @@ function renderEntry(entry) {
       const num = c.dim(String(idx + 1).padStart(2, ' '));
       const lines = wrapText(def.definition, width - 6);
       console.log('  ' + num + '  ' + lines[0]);
-      for (let i = 1; i < lines.length; i++) console.log('      ' + lines[i]);
+      for (let i = 1; i < lines.length; i++) {
+        console.log('      ' + lines[i]);
+      }
+
       if (def.example) {
         const exLines = wrapText('“' + def.example + '”', width - 8);
-        for (const line of exLines) console.log('      ' + c.dim(c.it(line)));
+        for (const line of exLines) {
+          console.log('      ' + c.dim(c.it(line)));
+        }
+      }
+
+      if (def.translation) {
+        const trLines = wrapText('→ ' + def.translation, width - 8);
+        for (const line of trLines) {
+          console.log('      ' + c.dim(line));
+        }
       }
     });
+
     if (!showAll && meaning.definitions.length > MAX_DEFS) {
       console.log('      ' + c.dim(`… ${meaning.definitions.length - MAX_DEFS} more (--all)`));
     }
+
+    // Synonyms & Antonyms
+    if (showSyn || meaning.synonyms.length || meaning.antonyms.length) {
+      if (meaning.synonyms && meaning.synonyms.length) {
+        const syns = meaning.synonyms.slice(0, 8);
+        console.log('      ' + c.dim('synonyms: ') + syns.map(s => c.ok(s)).join(c.dim(', ')));
+      }
+      if (meaning.antonyms && meaning.antonyms.length) {
+        const ants = meaning.antonyms.slice(0, 8);
+        console.log('      ' + c.dim('antonyms: ') + ants.map(s => c.warn(s)).join(c.dim(', ')));
+      }
+    }
   }
-  console.log('');
+
+  // Source footer
+  if (entry.source) {
+    console.log('');
+    console.log('  ' + c.dim(`(${entry.source})`));
+  } else {
+    console.log('');
+  }
+
+  // Play audio if requested
+  if (willPlay && entry.audioUrl) {
+    E.playAudio(entry.audioUrl);
+  }
 }
 
-function renderNotFound(word) {
-  const f = suggest(word);
+async function renderNotFound(word, targetLang) {
+  const currentLang = targetLang || lang;
+  const f = await getSuggestions(word);
+
   if (f.autoMatch) {
     console.log('');
     console.log(c.dim('did you mean ') + c.bold(c.accent(f.autoMatch)) + c.dim(' ?'));
-    return lookup(f.autoMatch).then(renderEntry);
+    try {
+      const entry = await lookupWord(f.autoMatch, currentLang);
+      renderEntry(entry);
+      return entry;
+    } catch (e) {}
   }
-  if (!raw && f.alternatives.length) {
+
+  if (!raw && f.alternatives && f.alternatives.length) {
     console.log('');
     console.log(c.dim('not found — did you mean:'));
-    console.log('  ' + f.alternatives.map(pill).join('  '));
+    console.log('  ' + f.alternatives.map(a => pill(a)).join('  '));
     console.log('');
-    return;
+    return null;
   }
+
   if (raw) {
-    console.error(`no entry for "${word}"`);
-    return;
+    process.stderr.write(`no entry for "${word}"\n`);
+    return null;
   }
+
   const jab = jabs[Math.floor(Math.random() * jabs.length)];
   const kao = kaomoji[Math.floor(Math.random() * kaomoji.length)];
   console.log('');
   console.log(c.accent(jab));
   console.log(c.dim(kao));
   console.log('');
+  return null;
 }
 
-async function doLookup(word) {
-  const cached = readCache(word);
+async function doLookup(word, opts = {}) {
+  const currentLang = opts.lang || lang;
+  const cached = readCache(word, currentLang);
   const stop = cached ? null : startSpinner(`looking up “${word}”`);
-  let entry, err;
-  try { entry = await lookup(word); } catch (e) { err = e; }
+
+  let entry = null;
+  let err = null;
+
+  try {
+    entry = await lookupWord(word, currentLang);
+  } catch (e) {
+    err = e;
+  }
+
   if (stop) stop();
 
-  if (!err) { renderEntry(entry); return true; }
-  if (err.notFound) { await renderNotFound(word); return false; }
-  console.error(c.dim(err.name === 'AbortError'
-    ? 'took too long — is the network up?'
-    : 'error: ' + err.message));
-  return false;
+  if (!err && entry) {
+    renderEntry(entry, opts);
+    return entry;
+  }
+
+  if (err && err.notFound) {
+    const matched = await renderNotFound(word, currentLang);
+    return matched;
+  }
+
+  console.error(c.dim(err && err.name === 'AbortError'
+    ? 'lookup timed out — please check network connection'
+    : 'error: ' + (err ? err.message : 'lookup failed')));
+  return null;
 }
 
-// ---- main ----
+// ---- main runner ----
 (async () => {
   if (words.length) {
     let ok = true;
-    for (const w of words) ok = (await doLookup(w)) && ok;
+    for (const w of words) {
+      const res = await doLookup(w, { play: playAudioFlag });
+      if (!res) ok = false;
+    }
     process.exit(ok ? 0 : 1);
   }
 
-  // REPL
+  // ---- Interactive REPL ----
   console.log('');
-  console.log(c.bold(c.accent('dict')) + dot + c.dim('wiktionary lookup'));
-  console.log(c.dim('type a word to look up') + dot + c.dim(':q to quit') + dot + c.dim('-h for flags'));
+  console.log(c.bold(c.accent('dict')) + dot + c.dim('hybrid terminal dictionary'));
+  console.log(c.dim('type word to look up') + dot + c.dim(':p to play audio') + dot + c.dim(':all for all defs') + dot + c.dim(':q to quit'));
   console.log('');
 
   const rl = readline.createInterface({
@@ -335,32 +446,103 @@ async function doLookup(word) {
     output: process.stdout,
     prompt: c.dim('dict') + ' ' + c.bold(c.accent('❯')) + ' '
   });
-  rl.prompt(); // <- this was missing, which is why the prompt never showed up
-               //    until you typed something and the first keypress forced
-               //    a redraw. readline never prints its own prompt for you.
 
+  rl.prompt();
+
+  let lastEntry = null;
   let inflight = 0;
+
   const quitting = () => {
     console.log(c.dim('bye') + dot + c.dim('(˘︶˘)'));
     process.exit(0);
   };
+
   rl.on('line', async (line) => {
     const q = line.trim();
     if (!q) { rl.prompt(); return; }
+
+    // REPL commands
     if (q === ':q' || q === ':quit' || q === ':exit') {
       if (!inflight) return quitting();
-      // wait for pending lookups, then quit
       rl.removeAllListeners('line');
       const timer = setInterval(() => { if (!inflight) { clearInterval(timer); quitting(); } }, 100);
       return;
     }
+
+    if (q === ':p' || q === ':play') {
+      if (lastEntry && lastEntry.audioUrl) {
+        console.log(c.dim('  🔊 playing audio…'));
+        E.playAudio(lastEntry.audioUrl);
+      } else if (lastEntry) {
+        console.log(c.dim('  no audio pronunciation available for “' + lastEntry.word + '”'));
+      } else {
+        console.log(c.dim('  look up a word first'));
+      }
+      rl.prompt();
+      return;
+    }
+
+    if (q === ':all') {
+      showAll = !showAll;
+      console.log(c.dim(`showing all definitions: ${showAll ? 'enabled' : 'disabled'}`));
+      rl.prompt();
+      return;
+    }
+
+    if (q === ':syn') {
+      showSyn = !showSyn;
+      console.log(c.dim(`showing synonyms & antonyms: ${showSyn ? 'enabled' : 'disabled'}`));
+      rl.prompt();
+      return;
+    }
+
+    if (q.startsWith(':l ') || q.startsWith(':lang ')) {
+      const target = q.split(/\s+/)[1];
+      if (target && E.langLabel(target)) {
+        lang = target.toLowerCase();
+        console.log(c.dim(`switched language to ${E.langLabel(lang)} (${lang})`));
+      } else {
+        console.log(c.dim(`unknown language code. Available: ${E.LANGUAGES.map(x => x.value).join(', ')}`));
+      }
+      rl.prompt();
+      return;
+    }
+
+    if (q === ':h' || q === ':help') {
+      console.log('');
+      console.log(c.bold('REPL Commands:'));
+      console.log('  :p, :play       replay audio pronunciation for last word');
+      console.log('  :all            toggle displaying all definitions');
+      console.log('  :syn            toggle synonyms & antonyms display');
+      console.log('  :l <code>       switch language (e.g. :l fr, :l de, :l en)');
+      console.log('  :c, :clear      clear terminal screen');
+      console.log('  :q, :quit       exit dict');
+      console.log('');
+      rl.prompt();
+      return;
+    }
+
+    if (q === ':c' || q === ':clear') {
+      process.stdout.write('\x1b[2J\x1b[0;0H');
+      rl.prompt();
+      return;
+    }
+
+    // Word lookup
     inflight++;
-    try { await doLookup(q); } finally { inflight--; }
+    try {
+      const res = await doLookup(q);
+      if (res) lastEntry = res;
+    } finally {
+      inflight--;
+    }
     rl.prompt();
   });
+
   rl.on('close', () => {
     if (!inflight) return quitting();
     const timer = setInterval(() => { if (!inflight) { clearInterval(timer); quitting(); } }, 100);
   });
+
   rl.on('SIGINT', () => rl.close());
 })();
