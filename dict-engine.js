@@ -1,5 +1,6 @@
 // dict-engine.js — Hybrid Dictionary & Pronunciation Engine
-// Built for dict-cli. Zero dependencies.
+// Built for dict-cli & viyoga.github.io. Zero dependencies.
+// Works seamlessly in both Node.js and modern Web Browsers.
 // Sources:
 //   1. Free Dictionary API (rich phonetics, direct audio, synonyms/antonyms)
 //   2. Wikimedia REST API (official, ultra-reliable definitions & examples, zero citation clutter)
@@ -51,6 +52,21 @@
 
   function defaultLanguage() { return "en"; }
   function languages() { return LANGUAGES.slice(); }
+
+  // Case-handling: walk candidate spellings (Time -> time, Time; norway -> norway, Norway)
+  function lookupCandidates(word) {
+    var w = String(word || "").trim();
+    var out = [];
+    function push(v) {
+      if (v && v !== "" && out.indexOf(v) === -1) out.push(v);
+    }
+    if (w === "") return out;
+    push(w.toLowerCase());
+    push(w);
+    push(w.charAt(0).toUpperCase() + w.slice(1));
+    push(w.charAt(0).toLowerCase() + w.slice(1));
+    return out;
+  }
 
   // Priority ranking for parts of speech so main lexical categories come first
   var POS_PRIORITY = {
@@ -129,17 +145,19 @@
     return apiBase(langCode) + encodeURIComponent(w);
   }
 
-  // ---- Network Fetch with Timeout ----
+  // ---- Network Fetch with Timeout (Isomorphic: Browser + Node) ----
   async function fetchWithTimeout(url, timeoutMs) {
     var ac = new AbortController();
     var t = setTimeout(function() { ac.abort(); }, timeoutMs || 3500);
     try {
-      var res = await fetch(url, {
-        signal: ac.signal,
-        headers: {
+      var options = { signal: ac.signal };
+      // Only set User-Agent in Node.js (setting User-Agent in browser fetch is forbidden)
+      if (typeof window === 'undefined') {
+        options.headers = {
           'User-Agent': 'dict-cli/2.0 (terminal dictionary tool; https://github.com/viyoga/dict-cli)'
-        }
-      });
+        };
+      }
+      var res = await fetch(url, options);
       return res;
     } finally {
       clearTimeout(t);
@@ -252,8 +270,10 @@
       if (!data || typeof data !== "object") return null;
 
       var sections = data[code];
-      // If requested language not found in English Wiktionary, check if it's English
-      if ((!sections || !sections.length) && code === "en") sections = data.en;
+      // If requested language not found in English Wiktionary, check if it's English or fallback to first available language (e.g. Swahili for 'viyoga')
+      if ((!sections || !sections.length) && code === "en") {
+        sections = data.en || Object.values(data)[0];
+      }
       if (!sections || !sections.length) return null;
 
       var meaningsMap = {};
@@ -406,7 +426,6 @@
   }
 
   // ---- Tier 4: Native Language Wiktionary Fallback Parser ----
-  // (Used when neither Dictionary API nor English Wiktionary REST has the word)
   function parseSections(text) {
     text = String(text || "").replace(/\r\n/g, "\n").replace(/^\uFEFF/, "");
     var root = { level: 1, title: "", body: "", children: [] };
@@ -504,31 +523,35 @@
     var w = String(word || "").trim();
     if (!w) throw new Error("no word specified");
     var lang = String(langCode || defaultLanguage()).toLowerCase().trim();
+    var candidates = lookupCandidates(w);
 
-    var entry = null;
+    for (var i = 0; i < candidates.length; i++) {
+      var cand = candidates[i];
+      var entry = null;
 
-    // 1. For English, attempt Free Dictionary API first (best phonetics & audio)
-    if (lang === "en") {
-      entry = await lookupFreeDictionary(w);
-    }
+      // 1. For English, attempt Free Dictionary API first (best phonetics & audio)
+      if (lang === "en") {
+        entry = await lookupFreeDictionary(cand);
+      }
 
-    // 2. If not found or non-English, try official Wiktionary REST API
-    if (!entry) {
-      entry = await lookupWiktionaryRest(w, lang);
-    }
+      // 2. If not found or non-English, try official Wiktionary REST API
+      if (!entry) {
+        entry = await lookupWiktionaryRest(cand, lang);
+      }
 
-    // 3. Enrich missing IPA / audio from Wikimedia Commons metadata
-    if (entry) {
-      entry = await enrichWiktionaryMetadata(entry, w, lang);
-      return { ok: true, entry: entry };
-    }
-
-    // 4. Fallback for non-English to native Wiktionary edition
-    if (lang !== "en") {
-      entry = await lookupNativeWiktionary(w, lang);
+      // 3. Enrich missing IPA / audio from Wikimedia Commons metadata
       if (entry) {
-        entry = await enrichWiktionaryMetadata(entry, w, lang);
+        entry = await enrichWiktionaryMetadata(entry, cand, lang);
         return { ok: true, entry: entry };
+      }
+
+      // 4. Fallback for non-English to native Wiktionary edition
+      if (lang !== "en") {
+        entry = await lookupNativeWiktionary(cand, lang);
+        if (entry) {
+          entry = await enrichWiktionaryMetadata(entry, cand, lang);
+          return { ok: true, entry: entry };
+        }
       }
     }
 
@@ -539,12 +562,21 @@
   }
 
   // ---- Audio Pronunciation Player ----
-  // Plays audio headlessly in the background. Absolutely ZERO GUI windows are opened.
   function playAudio(url) {
     if (!url || typeof url !== "string") return false;
+    // Browser environment
+    if (typeof window !== 'undefined') {
+      try {
+        var a = new Audio(url);
+        a.play();
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+    // Node.js CLI environment: completely headless spawn
     try {
       var cp = require("child_process");
-      // Try mpv first with --vo=null, fallback to ffplay -nodisp
       var players = [
         { bin: "mpv", args: ["--no-video", "--vo=null", "--really-quiet", url] },
         { bin: "ffplay", args: ["-nodisp", "-autoexit", "-loglevel", "quiet", url] }
@@ -561,9 +593,7 @@
           return true;
         } catch (err) {}
       }
-    } catch (e) {
-      /* media player not available */
-    }
+    } catch (e) {}
     return false;
   }
 
@@ -614,7 +644,7 @@
     return { autoMatch: null, alternatives: alts };
   }
 
-  // Online suggestion via Datamuse API with offline wordlist fallback
+  // Suggestion: Datamuse API with offline wordlist fallback
   async function suggest(word) {
     var target = String(word || "").toLowerCase().trim();
     if (!target) return { autoMatch: null, alternatives: [] };
@@ -624,7 +654,6 @@
       if (res.ok) {
         var data = await res.json();
         if (Array.isArray(data) && data.length) {
-          // Filter to single words and reasonable length
           var candidates = [];
           for (var i = 0; i < data.length; i++) {
             var cw = String(data[i].word || "").toLowerCase().trim();
@@ -634,7 +663,6 @@
           }
 
           if (candidates.length) {
-            // If top candidate is very close
             var d0 = levenshtein(target, candidates[0]);
             if (d0 <= 2 && candidates[0] !== target) {
               return { autoMatch: candidates[0], alternatives: candidates.slice(1, 5) };
@@ -652,7 +680,6 @@
 
   // ---- Backward Compatibility Wrappers ----
   function parseResponse(raw, langCode) {
-    // Kept for backward compatibility if called synchronously with MediaWiki JSON
     try {
       var data = JSON.parse(raw);
       if (data && data.query && data.query.pages) {
@@ -689,6 +716,7 @@
     langLabel: langLabel,
     langWikiName: langWikiName,
     defaultLanguage: defaultLanguage,
+    lookupCandidates: lookupCandidates,
     apiBase: apiBase,
     lookupUrl: lookupUrl,
     lookup: lookup,
